@@ -1,0 +1,21 @@
+# 本地环境与密钥（切勿提交）
+.env
+.env.*
+!.env.example
+
+# 依赖
+node_modules/
+
+# 脚本生成的会话与产出（可能含个人图片/视频）
+work_dir/
+
+# 日志与系统文件
+*.log
+.DS_Store
+Thumbs.db
+
+# 编辑器与本地工具
+.idea/
+.vscode/
+*.swp
+*.swo
