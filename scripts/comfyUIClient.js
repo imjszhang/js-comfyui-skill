@@ -24,6 +24,8 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const net = require('net');
+const tls = require('tls');
 const { URL } = require('url');
 
 /**
@@ -45,11 +47,200 @@ const projectRoot = resolveProjectRoot(__dirname);
 require('dotenv').config({ path: path.join(projectRoot, '.env') });
 global.rootDir = projectRoot;
 
+function parseProxyUrl(value) {
+    if (!value || !String(value).trim()) return null;
+    const raw = String(value).trim();
+    const withProtocol = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+    return new URL(withProtocol);
+}
+
+function proxyBasicAuthHeader(proxy) {
+    if (!proxy.username) return null;
+    const user = decodeURIComponent(proxy.username);
+    const pass = decodeURIComponent(proxy.password || '');
+    return `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
+}
+
+function connectHttpProxyTunnel(proxy, target) {
+    return new Promise((resolve, reject) => {
+        const proxyPort = Number(proxy.port || 80);
+        const targetPort = Number(target.port || 443);
+        const socket = net.connect(proxyPort, proxy.hostname);
+        let buffer = Buffer.alloc(0);
+        let settled = false;
+
+        const fail = (error) => {
+            if (settled) return;
+            settled = true;
+            socket.destroy();
+            reject(error);
+        };
+
+        socket.setTimeout(20000, () => fail(new Error('连接 HTTP 代理超时')));
+        socket.once('error', fail);
+        socket.once('connect', () => {
+            const lines = [
+                `CONNECT ${target.hostname}:${targetPort} HTTP/1.1`,
+                `Host: ${target.hostname}:${targetPort}`
+            ];
+            const auth = proxyBasicAuthHeader(proxy);
+            if (auth) lines.push(`Proxy-Authorization: ${auth}`);
+            lines.push('', '');
+            socket.write(lines.join('\r\n'));
+        });
+
+        socket.on('data', (chunk) => {
+            buffer = Buffer.concat([buffer, chunk]);
+            const sep = buffer.indexOf('\r\n\r\n');
+            if (sep === -1) return;
+            const head = buffer.subarray(0, sep).toString('utf8');
+            const extra = buffer.subarray(sep + 4);
+            const status = Number((head.split(' ')[1] || '').trim());
+            if (status !== 200) {
+                fail(new Error(`代理 CONNECT 失败: ${head.split('\r\n')[0]}`));
+                return;
+            }
+            socket.removeAllListeners('data');
+            socket.setTimeout(0);
+            if (extra.length) socket.unshift(extra);
+            const tlsSocket = tls.connect({ socket, servername: target.hostname });
+            tlsSocket.once('secureConnect', () => {
+                if (settled) return;
+                settled = true;
+                resolve(tlsSocket);
+            });
+            tlsSocket.once('error', fail);
+        });
+    });
+}
+
+function connectSocks5(proxy, target) {
+    return new Promise((resolve, reject) => {
+        const proxyPort = Number(proxy.port || 1080);
+        const targetPort = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
+        const socket = net.connect(proxyPort, proxy.hostname);
+        const user = proxy.username ? decodeURIComponent(proxy.username) : '';
+        const pass = proxy.password ? decodeURIComponent(proxy.password) : '';
+        let stage = 'greeting';
+        let buffer = Buffer.alloc(0);
+        let settled = false;
+
+        const fail = (error) => {
+            if (settled) return;
+            settled = true;
+            socket.destroy();
+            reject(error);
+        };
+
+        const finish = (stream) => {
+            if (settled) return;
+            settled = true;
+            resolve(stream);
+        };
+
+        socket.setTimeout(20000, () => fail(new Error('连接 SOCKS5 代理超时')));
+        socket.once('error', fail);
+        socket.once('connect', () => {
+            const methods = user ? [0x00, 0x02] : [0x00];
+            socket.write(Buffer.from([0x05, methods.length, ...methods]));
+        });
+
+        const sendConnect = () => {
+            const hostBuf = Buffer.from(target.hostname);
+            const req = Buffer.alloc(7 + hostBuf.length);
+            req[0] = 0x05;
+            req[1] = 0x01;
+            req[2] = 0x00;
+            req[3] = 0x03;
+            req[4] = hostBuf.length;
+            hostBuf.copy(req, 5);
+            req.writeUInt16BE(targetPort, 5 + hostBuf.length);
+            socket.write(req);
+            stage = 'connect';
+            buffer = Buffer.alloc(0);
+        };
+
+        socket.on('data', (chunk) => {
+            buffer = Buffer.concat([buffer, chunk]);
+            if (stage === 'greeting') {
+                if (buffer.length < 2) return;
+                if (buffer[0] !== 0x05 || buffer[1] === 0xff) {
+                    fail(new Error('SOCKS5 代理拒绝认证方式'));
+                    return;
+                }
+                if (buffer[1] === 0x02) {
+                    const userBuf = Buffer.from(user);
+                    const passBuf = Buffer.from(pass);
+                    const auth = Buffer.alloc(3 + userBuf.length + passBuf.length);
+                    auth[0] = 0x01;
+                    auth[1] = userBuf.length;
+                    userBuf.copy(auth, 2);
+                    auth[2 + userBuf.length] = passBuf.length;
+                    passBuf.copy(auth, 3 + userBuf.length);
+                    stage = 'auth';
+                    buffer = Buffer.alloc(0);
+                    socket.write(auth);
+                    return;
+                }
+                if (buffer[1] !== 0x00) {
+                    fail(new Error(`SOCKS5 握手失败，方法 ${buffer[1]}`));
+                    return;
+                }
+                sendConnect();
+                return;
+            }
+
+            if (stage === 'auth') {
+                if (buffer.length < 2) return;
+                if (buffer[1] !== 0x00) {
+                    fail(new Error('SOCKS5 代理认证失败'));
+                    return;
+                }
+                sendConnect();
+                return;
+            }
+
+            if (buffer.length < 5 || buffer[0] !== 0x05) return;
+            if (buffer[1] !== 0x00) {
+                fail(new Error(`SOCKS5 连接目标失败，状态 ${buffer[1]}`));
+                return;
+            }
+            const atyp = buffer[3];
+            let headerLength = 0;
+            if (atyp === 0x01) headerLength = 10;
+            else if (atyp === 0x03) headerLength = 7 + buffer[4];
+            else if (atyp === 0x04) headerLength = 22;
+            else {
+                fail(new Error(`SOCKS5 返回了未知地址类型 ${atyp}`));
+                return;
+            }
+            if (buffer.length < headerLength) return;
+
+            socket.removeAllListeners('data');
+            socket.setTimeout(0);
+            const extra = buffer.subarray(headerLength);
+            if (extra.length) socket.unshift(extra);
+
+            if (target.protocol === 'https:') {
+                const tlsSocket = tls.connect({ socket, servername: target.hostname });
+                tlsSocket.once('secureConnect', () => finish(tlsSocket));
+                tlsSocket.once('error', fail);
+                return;
+            }
+            finish(socket);
+        });
+    });
+}
+
 class ComfyUIClient {
     constructor(options = {}) {
         this.config = {
             // API配置
-            serverUrl: options.serverUrl || process.env.COMFYUI_SERVER_URL || 'http://127.0.0.1:8188',
+            serverUrl: (options.serverUrl || process.env.COMFYUI_SERVER_URL || 'http://127.0.0.1:8188').replace(/\/+$/, ''),
+            proxyUrl: options.proxyUrl || process.env.COMFYUI_PROXY || '',
+            apiKey: options.apiKey || process.env.COMFYUI_API_KEY || '',
+            apiUser: options.apiUser || process.env.COMFYUI_API_USER || 'user',
+            checkOnly: Boolean(options.checkOnly),
             clientId: options.clientId || this.generateClientId(),
 
             // 工作流配置
@@ -108,6 +299,19 @@ class ComfyUIClient {
     validateConfig() {
         console.log('🔍 验证配置参数...');
 
+        if (this.config.proxyUrl) {
+            try {
+                parseProxyUrl(this.config.proxyUrl);
+            } catch (error) {
+                throw new Error(`❌ 代理地址无效: ${this.config.proxyUrl}`);
+            }
+        }
+
+        if (this.config.checkOnly) {
+            console.log('✅ 连接检查模式');
+            return;
+        }
+
         // 验证工作流
         if (!this.config.workflowFile && !this.config.workflow) {
             throw new Error('❌ 必须提供工作流文件 (--workflow) 或工作流对象');
@@ -157,6 +361,7 @@ class ComfyUIClient {
             sessionDirectory: this.sessionDir,
             config: {
                 serverUrl: this.config.serverUrl,
+                proxyUrl: this.config.proxyUrl || null,
                 clientId: this.config.clientId,
                 workflowFile: this.config.workflowFile,
                 promptNode: this.config.promptNode,
@@ -729,60 +934,178 @@ class ComfyUIClient {
     }
 
     /**
+     * 拼出带服务前缀的 API 地址
+     */
+    apiPath(suffix) {
+        const pathPart = suffix.startsWith('/') ? suffix : `/${suffix}`;
+        return `${this.config.serverUrl}${pathPart}`;
+    }
+
+    /**
+     * 网关 Basic 认证：用户名任意，密码为 API Key
+     */
+    buildHeaders(extra = {}) {
+        const headers = { ...extra };
+        const hasAuth = headers.Authorization || headers.authorization;
+        if (this.config.apiKey && !hasAuth) {
+            const token = Buffer.from(`${this.config.apiUser}:${this.config.apiKey}`).toString('base64');
+            headers.Authorization = `Basic ${token}`;
+        }
+        return headers;
+    }
+
+    /**
+     * 创建已接好代理的 HTTP 请求
+     */
+    async createRequest(targetUrl, { method, headers }) {
+        const target = new URL(targetUrl);
+        const requestPath = `${target.pathname}${target.search}`;
+        const port = target.port || (target.protocol === 'https:' ? 443 : 80);
+        const proxy = parseProxyUrl(this.config.proxyUrl);
+
+        if (!proxy) {
+            const httpModule = target.protocol === 'https:' ? https : http;
+            return httpModule.request({
+                hostname: target.hostname,
+                port,
+                path: requestPath,
+                method,
+                headers
+            });
+        }
+
+        if (proxy.protocol === 'http:' && target.protocol === 'http:') {
+            const proxyHeaders = {
+                ...headers,
+                Host: headers.Host || headers.host || target.host
+            };
+            const auth = proxyBasicAuthHeader(proxy);
+            if (auth) proxyHeaders['Proxy-Authorization'] = auth;
+            return http.request({
+                hostname: proxy.hostname,
+                port: proxy.port || 80,
+                method,
+                path: target.href,
+                headers: proxyHeaders
+            });
+        }
+
+        let socket;
+        if (proxy.protocol === 'http:' && target.protocol === 'https:') {
+            socket = await connectHttpProxyTunnel(proxy, target);
+        } else if (proxy.protocol === 'socks5:' || proxy.protocol === 'socks:') {
+            socket = await connectSocks5(proxy, target);
+        } else {
+            throw new Error(`不支持的代理协议: ${proxy.protocol}（可用 http:// 或 socks5://）`);
+        }
+
+        return http.request({
+            hostname: target.hostname,
+            port,
+            path: requestPath,
+            method,
+            headers,
+            agent: false,
+            createConnection: () => socket
+        });
+    }
+
+    /**
+     * 发出请求并返回响应流
+     */
+    openResponse(url, options = {}) {
+        return new Promise((resolve, reject) => {
+            const headers = this.buildHeaders({ ...options.headers });
+            const hasContentType = headers['Content-Type'] || headers['content-type'];
+            const body = options.body;
+            let payload = null;
+
+            if (body != null) {
+                payload = Buffer.isBuffer(body)
+                    ? body
+                    : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
+                if (!hasContentType && !Buffer.isBuffer(body) && typeof body !== 'string') {
+                    headers['Content-Type'] = 'application/json';
+                }
+                if (headers['Content-Length'] == null && headers['content-length'] == null) {
+                    headers['Content-Length'] = payload.length;
+                }
+            }
+
+            this.createRequest(url, {
+                method: options.method || 'GET',
+                headers
+            }).then((req) => {
+                req.setTimeout(this.config.timeout, () => {
+                    req.destroy(new Error('请求超时'));
+                });
+                req.on('error', reject);
+                req.on('response', resolve);
+                if (payload) req.write(payload);
+                req.end();
+            }).catch(reject);
+        });
+    }
+
+    /**
      * 发送 HTTP 请求
      */
     async httpRequest(url, options = {}) {
-        return new Promise((resolve, reject) => {
-            const urlObj = new URL(url);
-            const isHttps = urlObj.protocol === 'https:';
-            const httpModule = isHttps ? https : http;
-
-            const requestOptions = {
-                hostname: urlObj.hostname,
-                port: urlObj.port || (isHttps ? 443 : 80),
-                path: urlObj.pathname + urlObj.search,
-                method: options.method || 'GET',
-                headers: {
-                    'Content-Type': 'application/json',
-                    ...options.headers
-                }
-            };
-
-            const req = httpModule.request(requestOptions, (res) => {
-                let data = '';
-
-                res.on('data', (chunk) => { data += chunk; });
-
-                res.on('end', () => {
-                    try {
-                        const jsonData = res.statusCode >= 200 && res.statusCode < 300
-                            ? JSON.parse(data)
-                            : null;
-                        resolve({
-                            statusCode: res.statusCode,
-                            headers: res.headers,
-                            data: jsonData || data
-                        });
-                    } catch (error) {
-                        resolve({
-                            statusCode: res.statusCode,
-                            headers: res.headers,
-                            data: data
-                        });
-                    }
-                });
-            });
-
-            req.on('error', (error) => reject(error));
-
-            if (options.body) {
-                req.write(typeof options.body === 'string'
-                    ? options.body
-                    : JSON.stringify(options.body));
+        const res = await this.openResponse(url, options);
+        const chunks = [];
+        for await (const chunk of res) chunks.push(chunk);
+        const data = Buffer.concat(chunks).toString('utf8');
+        let parsed = data;
+        if (res.statusCode >= 200 && res.statusCode < 300 && data) {
+            try {
+                parsed = JSON.parse(data);
+            } catch (error) {
+                parsed = data;
             }
+        }
+        return {
+            statusCode: res.statusCode,
+            headers: res.headers,
+            data: parsed
+        };
+    }
 
-            req.end();
-        });
+    /**
+     * 检查代理、网关认证和远端 ComfyUI 是否可用
+     */
+    async checkConnection() {
+        const proxy = this.config.proxyUrl || '未使用';
+        console.log(`\n🌐 服务器: ${this.config.serverUrl}`);
+        console.log(`🔀 代理: ${proxy}`);
+
+        const stats = await this.httpRequest(this.apiPath('/system_stats'));
+        if (stats.statusCode !== 200 || !stats.data || !stats.data.system) {
+            const detail = typeof stats.data === 'string' ? stats.data.slice(0, 200) : JSON.stringify(stats.data);
+            throw new Error(`system_stats 返回 ${stats.statusCode}: ${detail}`);
+        }
+
+        const queue = await this.httpRequest(this.apiPath('/queue'));
+        if (queue.statusCode !== 200) {
+            throw new Error(`queue 返回 ${queue.statusCode}`);
+        }
+
+        const system = stats.data.system;
+        const device = Array.isArray(stats.data.devices) && stats.data.devices[0]
+            ? stats.data.devices[0].name
+            : '未知设备';
+        const running = Array.isArray(queue.data.queue_running) ? queue.data.queue_running.length : 0;
+        const pending = Array.isArray(queue.data.queue_pending) ? queue.data.queue_pending.length : 0;
+
+        console.log(`✅ ComfyUI ${system.comfyui_version}（${system.os}）`);
+        console.log(`✅ 设备: ${device}`);
+        console.log(`✅ 队列: 运行中 ${running}，等待中 ${pending}`);
+        return {
+            version: system.comfyui_version,
+            os: system.os,
+            device,
+            queueRunning: running,
+            queuePending: pending
+        };
     }
 
     /**
@@ -799,67 +1122,48 @@ class ComfyUIClient {
 
         console.log(`📤 上传图片到 ComfyUI: ${path.basename(absPath)}`);
 
-        return new Promise((resolve, reject) => {
-            const url = new URL(this.config.serverUrl);
-            const imageBuffer = fs.readFileSync(absPath);
-            const filename = targetName || path.basename(absPath);
-            const ext = path.extname(absPath).toLowerCase();
+        const imageBuffer = fs.readFileSync(absPath);
+        const filename = targetName || path.basename(absPath);
+        const ext = path.extname(absPath).toLowerCase();
 
-            const contentTypes = {
-                '.png': 'image/png',
-                '.jpg': 'image/jpeg',
-                '.jpeg': 'image/jpeg',
-                '.gif': 'image/gif',
-                '.webp': 'image/webp'
-            };
-            const contentType = contentTypes[ext] || 'image/png';
+        const contentTypes = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp'
+        };
+        const contentType = contentTypes[ext] || 'image/png';
 
-            const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
-            const body = Buffer.concat([
-                Buffer.from(`--${boundary}\r\n`),
-                Buffer.from(`Content-Disposition: form-data; name="image"; filename="${filename}"\r\n`),
-                Buffer.from(`Content-Type: ${contentType}\r\n\r\n`),
-                imageBuffer,
-                Buffer.from(`\r\n--${boundary}\r\n`),
-                Buffer.from(`Content-Disposition: form-data; name="overwrite"\r\n\r\n`),
-                Buffer.from('true'),
-                Buffer.from(`\r\n--${boundary}--\r\n`)
-            ]);
+        const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
+        const body = Buffer.concat([
+            Buffer.from(`--${boundary}\r\n`),
+            Buffer.from(`Content-Disposition: form-data; name="image"; filename="${filename}"\r\n`),
+            Buffer.from(`Content-Type: ${contentType}\r\n\r\n`),
+            imageBuffer,
+            Buffer.from(`\r\n--${boundary}\r\n`),
+            Buffer.from(`Content-Disposition: form-data; name="overwrite"\r\n\r\n`),
+            Buffer.from('true'),
+            Buffer.from(`\r\n--${boundary}--\r\n`)
+        ]);
 
-            const httpModule = url.protocol === 'https:' ? https : http;
-            const options = {
-                hostname: url.hostname,
-                port: url.port || (url.protocol === 'https:' ? 443 : 80),
-                path: '/upload/image',
+        try {
+            const response = await this.httpRequest(this.apiPath('/upload/image'), {
                 method: 'POST',
                 headers: {
-                    'Content-Type': `multipart/form-data; boundary=${boundary}`,
-                    'Content-Length': body.length
-                }
-            };
-
-            const req = httpModule.request(options, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    try {
-                        const result = JSON.parse(data);
-                        if (result.name) {
-                            console.log(`✅ 图片上传成功: ${result.name}`);
-                            resolve(result.name);
-                        } else {
-                            reject(new Error(`上传响应无效: ${data}`));
-                        }
-                    } catch (e) {
-                        reject(new Error(`解析上传响应失败: ${e.message}`));
-                    }
-                });
+                    'Content-Type': `multipart/form-data; boundary=${boundary}`
+                },
+                body
             });
-
-            req.on('error', e => reject(new Error(`上传失败: ${e.message}`)));
-            req.write(body);
-            req.end();
-        });
+            const result = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+            if (result && result.name) {
+                console.log(`✅ 图片上传成功: ${result.name}`);
+                return result.name;
+            }
+            throw new Error(`上传响应无效: ${JSON.stringify(response.data)}`);
+        } catch (error) {
+            throw new Error(`上传失败: ${error.message}`);
+        }
     }
 
     /**
@@ -868,7 +1172,7 @@ class ComfyUIClient {
     async queuePrompt(workflow) {
         console.log('\n📤 提交工作流到队列...');
 
-        const url = `${this.config.serverUrl}/prompt`;
+        const url = this.apiPath('/prompt');
         const payload = {
             prompt: workflow,
             client_id: this.config.clientId
@@ -903,7 +1207,7 @@ class ComfyUIClient {
      */
     async getQueueStatus() {
         try {
-            const url = `${this.config.serverUrl}/queue`;
+            const url = this.apiPath('/queue');
             const response = await this.httpRequest(url);
             if (response.statusCode !== 200) {
                 throw new Error(`查询队列失败: ${response.statusCode}`);
@@ -919,7 +1223,7 @@ class ComfyUIClient {
      */
     async getHistory(maxItems = 1) {
         try {
-            const url = `${this.config.serverUrl}/history/${this.promptId || ''}`;
+            const url = this.apiPath(`/history/${this.promptId || ''}`);
             const response = await this.httpRequest(url);
             if (response.statusCode !== 200) {
                 throw new Error(`获取历史失败: ${response.statusCode}`);
@@ -934,35 +1238,23 @@ class ComfyUIClient {
      * 下载文件
      */
     async downloadFile(url, outputPath) {
-        return new Promise((resolve, reject) => {
-            const urlObj = new URL(url);
-            const isHttps = urlObj.protocol === 'https:';
-            const httpModule = isHttps ? https : http;
+        const response = await this.openResponse(url, { method: 'GET' });
+        if (response.statusCode !== 200) {
+            response.resume();
+            throw new Error(`下载失败: ${response.statusCode}`);
+        }
 
+        await new Promise((resolve, reject) => {
             const file = fs.createWriteStream(outputPath);
-
-            httpModule.get(url, (response) => {
-                if (response.statusCode !== 200) {
-                    file.close();
-                    fs.unlinkSync(outputPath);
-                    reject(new Error(`下载失败: ${response.statusCode}`));
-                    return;
-                }
-
-                response.pipe(file);
-
-                file.on('finish', () => {
-                    file.close();
-                    resolve(outputPath);
-                });
-            }).on('error', (error) => {
+            response.pipe(file);
+            file.on('finish', () => {
                 file.close();
-                if (fs.existsSync(outputPath)) {
-                    fs.unlinkSync(outputPath);
-                }
-                reject(error);
+                resolve();
             });
+            file.on('error', reject);
+            response.on('error', reject);
         });
+        return outputPath;
     }
 
     /**
@@ -985,7 +1277,7 @@ class ComfyUIClient {
                     const fileExt = path.extname(filename).toLowerCase();
                     const subfolder = image.subfolder || '';
                     const type = image.type || 'output';
-                    const viewUrl = `${this.config.serverUrl}/view?filename=${filename}&subfolder=${subfolder}&type=${type}`;
+                    const viewUrl = this.apiPath(`/view?filename=${encodeURIComponent(filename)}&subfolder=${encodeURIComponent(subfolder)}&type=${encodeURIComponent(type)}`);
                     const outputFilename = `${nodeId}_${filename}`;
                     const outputPath = path.join(this.sessionDir, outputFilename);
 
@@ -1244,6 +1536,18 @@ function parseArguments() {
             case '--server':
                 options.serverUrl = args[++i];
                 break;
+            case '--proxy':
+                options.proxyUrl = args[++i];
+                break;
+            case '--api-key':
+                options.apiKey = args[++i];
+                break;
+            case '--api-user':
+                options.apiUser = args[++i];
+                break;
+            case '--check':
+                options.checkOnly = true;
+                break;
             case '--client-id':
                 options.clientId = args[++i];
                 break;
@@ -1320,7 +1624,11 @@ ComfyUI 工作流调用脚本 (comfyui-client 技能)
 
 选项:
   --workflow <file>           工作流 JSON 文件路径 (必需)
-  --server <url>              ComfyUI 服务器地址 (默认: http://127.0.0.1:8188)
+  --server <url>              ComfyUI 服务器地址 (默认: http://127.0.0.1:8188，或 .env 的 COMFYUI_SERVER_URL)
+  --proxy <url>               HTTP 或 SOCKS5 代理，例如 http://127.0.0.1:8080
+  --api-key <key>             网关 API Key，作为 HTTP Basic 密码
+  --api-user <user>           Basic 认证用户名 (默认: user，网关不校验用户名)
+  --check                     只检查代理和远端 ComfyUI，不提交工作流
   --client-id <id>            客户端 ID (默认: 自动生成)
   --prompt-node <node_id>     要修改的 prompt 节点 ID (可选)
   --prompt <text>             新的 prompt 文本 (可选)
@@ -1341,8 +1649,11 @@ ComfyUI 工作流调用脚本 (comfyui-client 技能)
   --poll-interval <ms>        轮询间隔，毫秒 (默认: 1000)
   --help                      显示帮助信息
 
-环境变量:
-  COMFYUI_SERVER_URL          ComfyUI 服务器地址
+环境变量（项目根目录 .env）:
+  COMFYUI_SERVER_URL          ComfyUI 服务器地址，可带路径前缀
+  COMFYUI_PROXY               HTTP 或 SOCKS5 代理
+  COMFYUI_API_KEY             网关 API Key
+  COMFYUI_API_USER            Basic 认证用户名，默认 user
 
 示例:
   # 文生图
@@ -1364,6 +1675,12 @@ async function main() {
 
         if (options.help) {
             showHelp();
+            process.exit(0);
+        }
+
+        if (options.checkOnly) {
+            const client = new ComfyUIClient(options);
+            await client.checkConnection();
             process.exit(0);
         }
 

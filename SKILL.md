@@ -180,7 +180,11 @@ node .claude/skills/comfyui-client/scripts/comfyUIClient.js --workflow .claude/s
 | 选项 | 说明 | 默认值 |
 |-----|------|--------|
 | `--workflow <file>` | 工作流 JSON 文件路径（必需） | - |
-| `--server <url>` | ComfyUI 服务器地址 | `http://127.0.0.1:8188` |
+| `--server <url>` | ComfyUI 服务器地址，可带路径前缀 | `http://127.0.0.1:8188` 或 `.env` 的 `COMFYUI_SERVER_URL` |
+| `--proxy <url>` | HTTP 或 SOCKS5 代理 | `.env` 的 `COMFYUI_PROXY`，未设置则直连 |
+| `--api-key <key>` | 网关 API Key，作为 HTTP Basic 密码 | `.env` 的 `COMFYUI_API_KEY` |
+| `--api-user <user>` | Basic 认证用户名 | `user` |
+| `--check` | 只检查代理和远端 ComfyUI | - |
 | `--client-id <id>` | 客户端 ID | 自动生成 |
 | `--prompt-node <node_id>` | 要修改的 prompt 节点 ID | 自动查找 |
 | `--prompt <text>` | 新的 prompt 文本 | - |
@@ -204,11 +208,18 @@ node .claude/skills/comfyui-client/scripts/comfyUIClient.js --workflow .claude/s
 ## 环境与本地配置
 
 1. **安装依赖**（读取 `.env` 需要 `dotenv`）：在项目根目录执行 `npm install`
-2. **可选**：复制 `cp .env.example .env`（Windows 可手动复制），按需修改 `COMFYUI_SERVER_URL`；勿将含密钥的 `.env` 提交到 Git（已在 `.gitignore` 中忽略）
+2. **可选**：复制 `cp .env.example .env`（Windows 可手动复制），按需修改服务器、代理和网关 API Key；勿将含密钥的 `.env` 提交到 Git（已在 `.gitignore` 中忽略）
 
 ## 环境变量
 
-- `COMFYUI_SERVER_URL` - ComfyUI 服务器地址，可覆盖 `--server` 默认值（亦可写在项目根目录的 `.env` 中）
+写在项目根目录的 `.env` 中，命令行同名参数优先：
+
+- `COMFYUI_SERVER_URL` - ComfyUI 服务器地址，可带路径前缀，例如 `http://10.8.0.5:8888/services/comfyui`
+- `COMFYUI_PROXY` - HTTP 或 SOCKS5 代理。本机 Docker HK 代理为 `http://127.0.0.1:8080`，同一隧道的 SOCKS5 为 `socks5://127.0.0.1:1080`
+- `COMFYUI_API_KEY` - 网关 API Key，请求时作为 HTTP Basic 密码
+- `COMFYUI_API_USER` - Basic 认证用户名，默认 `user`（网关不校验用户名）
+
+连通检查：`node scripts/comfyUIClient.js --check`
 
 ## 输出结构
 
@@ -283,6 +294,7 @@ console.log('生成文件:', result.generatedFiles);
 **1. ComfyUI 服务不可用**
 - 确认 ComfyUI 已启动
 - 检查 `--server` 或 `COMFYUI_SERVER_URL` 是否正确
+- 经代理访问时检查 `COMFYUI_PROXY`，网关返回 401 时检查 `COMFYUI_API_KEY`
 - 可访问 `http://127.0.0.1:8188` 验证
 
 **2. 工作流文件不存在**

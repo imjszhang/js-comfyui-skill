@@ -18,7 +18,7 @@ npm install
 
 若已在本地有副本，直接进入目录执行 `npm install` 即可。
 
-可选：复制环境变量模板并修改服务端地址（与命令行 `--server` 等价）。
+可选：复制环境变量模板，填写服务端地址、代理和网关 API Key（分别对应 `--server`、`--proxy`、`--api-key`）。
 
 ```bash
 cp .env.example .env   # Windows 可复制 .env.example 并重命名为 .env
