@@ -43,7 +43,7 @@ author: agent-js
 
 **脚本：** `scripts/comfyUIClient.js` - ComfyUI 工作流调用主脚本
 
-**工作流：** `assets/workflows/` - 5 个常用工作流（Z-Image、Qwen 编辑、Wan 视频等）
+**工作流：** `assets/workflows/` - 7 个常用工作流（Z-Image、Qwen 编辑、MiniMax 视频）
 
 **执行方式：**
 - 技能内脚本：`node .claude/skills/comfyui-client/scripts/comfyUIClient.js [选项]`
@@ -76,7 +76,7 @@ node .claude/skills/comfyui-client/scripts/comfyUIClient.js \
   --negative-prompt "blurry, low quality, watermark"
 ```
 
-**自动查找 prompt 节点：** 若不指定 `--prompt-node`，脚本会自动查找工作流中标题含 "Positive" 的 `CLIPTextEncode` 节点注入正面 prompt，标题含 "Negative" 的节点用于负面 prompt。对于 `TextEncodeQwenImageEditPlus`，优先选择有非空文本或标题含 "Positive" 的节点。
+**自动查找 prompt 节点：** 若不指定 `--prompt-node`，脚本会自动查找工作流中标题含 "Positive" 的 `CLIPTextEncode` 节点注入正面 prompt，标题含 "Negative" 的节点用于负面 prompt。对于 `TextEncodeQwenImageEditPlus`，优先选择有非空文本或标题含 "Positive" 的节点。MiniMax 工作流会注入 `MiniMaxH3ImageToVideo` 的 `prompt`，或标题含 "Prompt" 的 `PrimitiveStringMultiline`。
 
 ### 2. 指定 prompt 节点
 
@@ -167,13 +167,53 @@ node .claude/skills/comfyui-client/scripts/comfyUIClient.js \
 - 需要**理解图像内容**做语义修改 → 选 **Qwen 编辑**
 - 需要**保持构图/轮廓**做风格转换 → 选 **ControlNet**
 
-### 4. 视频生成
+### 4. 视频生成（MiniMax H3）
 
-支持 img2video、flf2video 等工作流。视频生成耗时较长，建议适当增加超时时间。
+视频生成耗时较长，建议 `--timeout 900`。提示词用 `--prompt`，子图里的提示词会在展开后自动注入。
+
+#### 4a. 文生视频
+
+不需要输入图片。
 
 ```bash
-node .claude/skills/comfyui-client/scripts/comfyUIClient.js --workflow .claude/skills/comfyui-client/assets/workflows/video_wan2_2_14B_i2v.json --prompt "视频描述" --timeout 900
+node .claude/skills/comfyui-client/scripts/comfyUIClient.js \
+  --workflow .claude/skills/comfyui-client/assets/workflows/video_minimax_h3_t2v.json \
+  --prompt "镜头缓慢推进" \
+  --timeout 900
 ```
+
+#### 4b. 图生视频
+
+- **输入**：1 张首帧图片
+- **LoadImage 节点 ID**：`114`
+
+```bash
+node .claude/skills/comfyui-client/scripts/comfyUIClient.js \
+  --workflow .claude/skills/comfyui-client/assets/workflows/video_minimax_h3_i2v.json \
+  --prompt "镜头缓慢推进" \
+  --image-node 114 --image-path "path/to/input.png" \
+  --timeout 900
+```
+
+#### 4c. 参考图生视频
+
+用 1–2 张参考图约束主体。提示词节点是标题为 `Input Text (Prompt)` 的 `PrimitiveStringMultiline`。
+
+- **LoadImage 节点 ID**：参考图 1 `137`，参考图 2 `139`
+- **Prompt 节点 ID**：`138`
+
+```bash
+node .claude/skills/comfyui-client/scripts/comfyUIClient.js \
+  --workflow .claude/skills/comfyui-client/assets/workflows/video_minimax_h3_r2v.json \
+  --prompt "让图 1 的角色穿过图 2 的场景" \
+  --image-node 137 --image-path "path/to/subject.png" \
+  --image-node2 139 --image-path2 "path/to/scene.png" \
+  --timeout 900
+```
+
+#### 4d. Fun ControlNet 视频
+
+用一段控制视频（姿态、边缘等）引导生成。提示词节点同样是 `138`。控制视频在 `LoadVideo` 节点 `174`，客户端目前只上传图片，换控制视频时把文件放到 ComfyUI 的 input 目录并改该节点的文件名。
 
 ## 命令行选项
 
@@ -244,8 +284,10 @@ work_dir/comfyui_output/
 | z_image_turbo | `.claude/skills/comfyui-client/assets/workflows/image_z_image_turbo.json` | 文生图（快速出图，9 步） | 自动 | - |
 | z_image_turbo_controlnet | `.claude/skills/comfyui-client/assets/workflows/image_z_image_turbo_fun_union_controlnet.json` | ControlNet 结构引导重绘 | 自动（子图展开后） | `58` |
 | qwen_image_edit | `.claude/skills/comfyui-client/assets/workflows/image_qwen_image_edit_2511.json` | Qwen 多图语义编辑 | `68`（正面），`69`（负面） | `41`（主图），`83`（参考2），`87`（参考3） |
-| wan_i2v | `.claude/skills/comfyui-client/assets/workflows/video_wan2_2_14B_i2v.json` | Wan 2.2 图生视频 | 自动 | - |
-| wan_flf2v | `.claude/skills/comfyui-client/assets/workflows/video_wan2_2_14B_flf2v.json` | Wan 2.2 首尾帧视频 | 自动 | - |
+| minimax_h3_t2v | `.claude/skills/comfyui-client/assets/workflows/video_minimax_h3_t2v.json` | MiniMax H3 文生视频 | 自动 | - |
+| minimax_h3_i2v | `.claude/skills/comfyui-client/assets/workflows/video_minimax_h3_i2v.json` | MiniMax H3 图生视频 | 自动 | `114` |
+| minimax_h3_r2v | `.claude/skills/comfyui-client/assets/workflows/video_minimax_h3_r2v.json` | MiniMax H3 参考图生视频 | `138` | `137`（参考1），`139`（参考2） |
+| minimax_h3_fun_controlnet | `.claude/skills/comfyui-client/assets/workflows/video_minimax_h3_fun_controlnet_union.json` | MiniMax H3 Fun ControlNet 视频 | `138` | 控制视频 `LoadVideo` `174` |
 
 ## 其他工作流（项目内）
 

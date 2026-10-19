@@ -8,11 +8,13 @@
 
 | 工作流类型 | 路径 | 说明 |
 |-----------|------|------|
-| Z-Image 文生图 | `.claude/skills/comfyui-client/assets/workflows/image_z_image.json` | Z-Image 高质量文生图，25 步出图（推荐 30-50 步） |
+| Z-Image Turbo 文生图 | `.claude/skills/comfyui-client/assets/workflows/image_z_image_turbo.json` | Z-Image Turbo 文生图 |
 | Z-Image Turbo + ControlNet | `.claude/skills/comfyui-client/assets/workflows/image_z_image_turbo_fun_union_controlnet.json` | 文生图 + Fun Union ControlNet 控制 |
 | Qwen 图片编辑 | `.claude/skills/comfyui-client/assets/workflows/image_qwen_image_edit_2511.json` | Qwen-Image-Edit 2511 图片编辑 |
-| Wan 2.2 图生视频 | `.claude/skills/comfyui-client/assets/workflows/video_wan2_2_14B_i2v.json` | Wan 2.2 14B 单图生成视频 |
-| Wan 2.2 首尾帧视频 | `.claude/skills/comfyui-client/assets/workflows/video_wan2_2_14B_flf2v.json` | Wan 2.2 14B 首尾帧生成视频 |
+| MiniMax H3 文生视频 | `.claude/skills/comfyui-client/assets/workflows/video_minimax_h3_t2v.json` | MiniMax H3 文本生成视频 |
+| MiniMax H3 图生视频 | `.claude/skills/comfyui-client/assets/workflows/video_minimax_h3_i2v.json` | MiniMax H3 单图生成视频，图片节点 `114` |
+| MiniMax H3 参考图生视频 | `.claude/skills/comfyui-client/assets/workflows/video_minimax_h3_r2v.json` | MiniMax H3 参考图生成视频，图片节点 `137`、`139`，提示词节点 `138` |
+| MiniMax H3 Fun ControlNet | `.claude/skills/comfyui-client/assets/workflows/video_minimax_h3_fun_controlnet_union.json` | MiniMax H3 控制视频生成视频，提示词节点 `138`，控制视频节点 `174` |
 
 ## 其他工作流（项目内）
 

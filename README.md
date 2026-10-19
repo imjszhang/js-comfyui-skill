@@ -47,7 +47,7 @@ npm run comfyui -- --help
 | 路径 | 说明 |
 |------|------|
 | `scripts/comfyUIClient.js` | 主脚本 |
-| `assets/workflows/` | 内置示例工作流（Z-Image、Qwen 编辑、Wan 视频等） |
+| `assets/workflows/` | 内置示例工作流（Z-Image、Qwen 编辑、MiniMax 视频） |
 | `SKILL.md` | 面向 Agent 的完整技能说明（能力、节点 ID、排错等） |
 | `references/workflow_paths.md` | 工作流路径速查 |
 

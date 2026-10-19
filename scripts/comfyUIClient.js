@@ -523,6 +523,35 @@ class ComfyUIClient {
                 linkIdsToRemove.add(outerInput.link);
             }
 
+            // 子图外层未连线的 widget 才是界面上的当前值，内层同名输入只是默认值。
+            let widgetCursor = 0;
+            const wrapperWidgets = Array.isArray(wrapperNode.widgets_values) ? wrapperNode.widgets_values : [];
+            for (let i = 0; i < (sgDef.inputs || []).length; i++) {
+                const sgInput = sgDef.inputs[i];
+                const outerInput = wrapperNode.inputs && wrapperNode.inputs[i];
+                const hasWidget = Boolean(outerInput && outerInput.widget);
+                const widgetValue = hasWidget ? wrapperWidgets[widgetCursor++] : undefined;
+                if (!hasWidget || !outerInput || outerInput.link != null) continue;
+                if (widgetValue === undefined) continue;
+
+                for (const intLinkId of (sgInput.linkIds || [])) {
+                    const intLink = inputLinks[intLinkId];
+                    if (!intLink) continue;
+                    const tgtNode = nodesToAdd.find(n => n.id === getNodeId(intLink.target_id));
+                    if (!tgtNode || !Array.isArray(tgtNode.inputs) || !tgtNode.inputs[intLink.target_slot]) continue;
+                    const targetInput = tgtNode.inputs[intLink.target_slot];
+                    if (!targetInput.widget) continue;
+
+                    let widgetIndex = 0;
+                    for (let slot = 0; slot < intLink.target_slot; slot++) {
+                        if (tgtNode.inputs[slot] && tgtNode.inputs[slot].widget) widgetIndex++;
+                    }
+                    if (!Array.isArray(tgtNode.widgets_values)) tgtNode.widgets_values = [];
+                    tgtNode.widgets_values[widgetIndex] = widgetValue;
+                    targetInput.link = null;
+                }
+            }
+
             for (let i = 0; i < (sgDef.outputs || []).length; i++) {
                 const sgOutput = sgDef.outputs[i];
                 const outerOutput = wrapperNode.outputs && wrapperNode.outputs[i];
@@ -908,6 +937,12 @@ class ComfyUIClient {
                     console.log(`✅ 已更新字段 "${field}"`);
                     break;
                 }
+            }
+
+            if (!modified && typeof workflow[nodeIdStr].inputs.value === 'string') {
+                workflow[nodeIdStr].inputs.value = promptText;
+                modified = true;
+                console.log('✅ 已更新字段 "value"');
             }
 
             if (!modified) {
@@ -1551,6 +1586,21 @@ class ComfyUIClient {
                     found = true;
                 }
                 if (!found) {
+                    for (const [nodeId, nodeData] of Object.entries(workflow)) {
+                        const title = (nodeData._title || '').toLowerCase();
+                        const isPromptPrimitive = nodeData.class_type === 'PrimitiveStringMultiline'
+                            && title.includes('prompt')
+                            && typeof nodeData.inputs.value === 'string';
+                        const isMinimaxPrompt = /^MiniMaxH3/.test(nodeData.class_type || '')
+                            && typeof nodeData.inputs.prompt === 'string';
+                        if (!isPromptPrimitive && !isMinimaxPrompt) continue;
+                        console.log(`✅ 找到 ${nodeData.class_type} 节点: ${nodeId}`);
+                        workflow = this.modifyWorkflowPrompt(workflow, nodeId, this.config.prompt);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
                     console.warn('⚠️  未找到可注入 prompt 的节点');
                 }
             }
@@ -1799,8 +1849,8 @@ ComfyUI 工作流调用脚本 (comfyui-client 技能)
   node .claude/skills/comfyui-client/scripts/comfyUIClient.js --workflow .claude/skills/comfyui-client/assets/workflows/image_z_image_turbo_fun_union_controlnet.json --prompt "oil painting style" --image-node 58 --image-path "path/to/input.png"
   # Qwen 多图编辑 (需先上传图片)
   node .claude/skills/comfyui-client/scripts/comfyUIClient.js --workflow .claude/skills/comfyui-client/assets/workflows/image_qwen_image_edit_2511.json --prompt-node 68 --prompt "Change material to fur" --image-node 41 --image-file "sofa.png" --image-node2 83 --image-file2 "fur.png"
-  # 视频生成
-  node .claude/skills/comfyui-client/scripts/comfyUIClient.js --workflow .claude/skills/comfyui-client/assets/workflows/video_wan2_2_14B_i2v.json --prompt "镜头缓慢推进" --timeout 900
+  # MiniMax 图生视频
+  node .claude/skills/comfyui-client/scripts/comfyUIClient.js --workflow .claude/skills/comfyui-client/assets/workflows/video_minimax_h3_i2v.json --prompt "镜头缓慢推进" --image-node 114 --image-path "path/to/input.png" --timeout 900
 `);
 }
 
