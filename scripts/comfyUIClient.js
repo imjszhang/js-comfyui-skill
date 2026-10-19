@@ -1229,9 +1229,40 @@ class ComfyUIClient {
     }
 
     /**
+     * 远端队列占用：正在执行和已经排队的任务都会占住这台显卡。
+     * 无法识别队列结构时返回 null。
+     */
+    queueOccupancy(queueStatus) {
+        if (!queueStatus || typeof queueStatus !== 'object' || Array.isArray(queueStatus)) return null;
+        return {
+            running: Array.isArray(queueStatus.queue_running) ? queueStatus.queue_running.length : 0,
+            pending: Array.isArray(queueStatus.queue_pending) ? queueStatus.queue_pending.length : 0
+        };
+    }
+
+    /**
+     * 提交前查一次远端队列。已有运行中或排队任务时直接返回，不提交。
+     */
+    async assertRemoteIdle() {
+        let occupancy;
+        try {
+            occupancy = this.queueOccupancy(await this.getQueueStatus());
+        } catch (error) {
+            throw new Error(`无法确认远端队列，未提交本次工作流: ${error.message}`);
+        }
+        if (!occupancy) {
+            throw new Error('远端队列响应无法识别，未提交本次工作流');
+        }
+        if (occupancy.running > 0 || occupancy.pending > 0) {
+            throw new Error(`远端已有任务（运行中 ${occupancy.running}，排队 ${occupancy.pending}），未提交本次工作流`);
+        }
+    }
+
+    /**
      * 提交工作流到队列
      */
     async queuePrompt(workflow) {
+        await this.assertRemoteIdle();
         console.log('\n📤 提交工作流到队列...');
 
         const url = this.apiPath('/prompt');
