@@ -47,6 +47,13 @@ const projectRoot = resolveProjectRoot(__dirname);
 require('dotenv').config({ path: path.join(projectRoot, '.env') });
 global.rootDir = projectRoot;
 
+class ComfyExecutionError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'ComfyExecutionError';
+    }
+}
+
 function parseProxyUrl(value) {
     if (!value || !String(value).trim()) return null;
     const raw = String(value).trim();
@@ -270,8 +277,9 @@ class ComfyUIClient {
             // 其他配置
             timeout: (options.timeout || 600) * 1000, // 转换为毫秒
             pollInterval: options.pollInterval || 1000,
-            retryCount: options.retryCount || 3,
-            retryDelay: options.retryDelay || 2000
+            // 网关偶发 "server error" 或连接中断时，短请求按 5s、10s、15s 重试
+            retryCount: options.retryCount || 4,
+            retryDelay: options.retryDelay || 5000
         };
 
         // 会话管理
@@ -1078,13 +1086,13 @@ class ComfyUIClient {
         console.log(`\n🌐 服务器: ${this.config.serverUrl}`);
         console.log(`🔀 代理: ${proxy}`);
 
-        const stats = await this.httpRequest(this.apiPath('/system_stats'));
+        const stats = await this.httpRequestWithRetry(this.apiPath('/system_stats'), {}, '检查服务');
         if (stats.statusCode !== 200 || !stats.data || !stats.data.system) {
             const detail = typeof stats.data === 'string' ? stats.data.slice(0, 200) : JSON.stringify(stats.data);
             throw new Error(`system_stats 返回 ${stats.statusCode}: ${detail}`);
         }
 
-        const queue = await this.httpRequest(this.apiPath('/queue'));
+        const queue = await this.httpRequestWithRetry(this.apiPath('/queue'), {}, '检查队列');
         if (queue.statusCode !== 200) {
             throw new Error(`queue 返回 ${queue.statusCode}`);
         }
@@ -1106,6 +1114,59 @@ class ComfyUIClient {
             queueRunning: running,
             queuePending: pending
         };
+    }
+
+    /**
+     * 网关偶发的失败：响应正文是 "server error"，或连接被中断。
+     * 工作流校验失败和任务执行失败不在这里重试。
+     */
+    isTransientGatewayError(error) {
+        if (!error) return false;
+        if (error.transient) return true;
+        const code = error.code || (error.cause && error.cause.code) || '';
+        if (['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'EAI_AGAIN'].includes(code)) return true;
+        return /server error|socket hang up|ECONNRESET|ECONNREFUSED|EPIPE|EAI_AGAIN/i.test(String(error.message || ''));
+    }
+
+    isTransientGatewayResponse(response) {
+        if (!response) return false;
+        const body = typeof response.data === 'string' ? response.data : '';
+        if (/server error/i.test(body)) return true;
+        return [502, 503, 504].includes(response.statusCode);
+    }
+
+    transientGatewayError(response) {
+        const body = typeof response.data === 'string'
+            ? response.data
+            : JSON.stringify(response.data || '');
+        const error = new Error(`网关临时错误: ${response.statusCode} ${body.slice(0, 200)}`);
+        error.transient = true;
+        return error;
+    }
+
+    async withGatewayRetry(label, fn) {
+        const tries = this.config.retryCount;
+        let lastError;
+        for (let attempt = 1; attempt <= tries; attempt++) {
+            try {
+                return await fn();
+            } catch (error) {
+                lastError = error;
+                if (!this.isTransientGatewayError(error) || attempt >= tries) throw error;
+                const wait = this.config.retryDelay * attempt;
+                console.warn(`⚠️  ${label}遇到网关临时错误，${wait / 1000}秒后重试 (${attempt}/${tries - 1}): ${String(error.message).slice(0, 120)}`);
+                await new Promise(resolve => setTimeout(resolve, wait));
+            }
+        }
+        throw lastError;
+    }
+
+    async httpRequestWithRetry(url, options, label) {
+        return this.withGatewayRetry(label, async () => {
+            const response = await this.httpRequest(url, options);
+            if (this.isTransientGatewayResponse(response)) throw this.transientGatewayError(response);
+            return response;
+        });
     }
 
     /**
@@ -1148,20 +1209,21 @@ class ComfyUIClient {
         ]);
 
         try {
-            const response = await this.httpRequest(this.apiPath('/upload/image'), {
+            const response = await this.httpRequestWithRetry(this.apiPath('/upload/image'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': `multipart/form-data; boundary=${boundary}`
                 },
                 body
-            });
+            }, '上传图片');
             const result = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
-            if (result && result.name) {
+            if (response.statusCode === 200 && result && result.name) {
                 console.log(`✅ 图片上传成功: ${result.name}`);
                 return result.name;
             }
-            throw new Error(`上传响应无效: ${JSON.stringify(response.data)}`);
+            throw new Error(`上传响应无效: ${response.statusCode} ${JSON.stringify(response.data)}`);
         } catch (error) {
+            if (this.isTransientGatewayError(error)) throw error;
             throw new Error(`上传失败: ${error.message}`);
         }
     }
@@ -1179,10 +1241,10 @@ class ComfyUIClient {
         };
 
         try {
-            const response = await this.httpRequest(url, {
+            const response = await this.httpRequestWithRetry(url, {
                 method: 'POST',
                 body: payload
-            });
+            }, '提交工作流');
 
             if (response.statusCode !== 200) {
                 throw new Error(`API 返回错误: ${response.statusCode} - ${JSON.stringify(response.data)}`);
@@ -1208,7 +1270,7 @@ class ComfyUIClient {
     async getQueueStatus() {
         try {
             const url = this.apiPath('/queue');
-            const response = await this.httpRequest(url);
+            const response = await this.httpRequestWithRetry(url, {}, '查询队列');
             if (response.statusCode !== 200) {
                 throw new Error(`查询队列失败: ${response.statusCode}`);
             }
@@ -1224,7 +1286,7 @@ class ComfyUIClient {
     async getHistory(maxItems = 1) {
         try {
             const url = this.apiPath(`/history/${this.promptId || ''}`);
-            const response = await this.httpRequest(url);
+            const response = await this.httpRequestWithRetry(url, {}, '查询历史');
             if (response.statusCode !== 200) {
                 throw new Error(`获取历史失败: ${response.statusCode}`);
             }
@@ -1238,23 +1300,34 @@ class ComfyUIClient {
      * 下载文件
      */
     async downloadFile(url, outputPath) {
-        const response = await this.openResponse(url, { method: 'GET' });
-        if (response.statusCode !== 200) {
-            response.resume();
-            throw new Error(`下载失败: ${response.statusCode}`);
-        }
+        return this.withGatewayRetry('下载文件', async () => {
+            const response = await this.openResponse(url, { method: 'GET' });
+            if (response.statusCode !== 200) {
+                const chunks = [];
+                for await (const chunk of response) chunks.push(chunk);
+                const body = Buffer.concat(chunks).toString('utf8');
+                const failure = { statusCode: response.statusCode, data: body };
+                if (this.isTransientGatewayResponse(failure)) throw this.transientGatewayError(failure);
+                throw new Error(`下载失败: ${response.statusCode} ${body.slice(0, 200)}`);
+            }
 
-        await new Promise((resolve, reject) => {
-            const file = fs.createWriteStream(outputPath);
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close();
-                resolve();
-            });
-            file.on('error', reject);
-            response.on('error', reject);
+            try {
+                await new Promise((resolve, reject) => {
+                    const file = fs.createWriteStream(outputPath);
+                    response.pipe(file);
+                    file.on('finish', () => {
+                        file.close();
+                        resolve();
+                    });
+                    file.on('error', reject);
+                    response.on('error', reject);
+                });
+            } catch (error) {
+                if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+                throw error;
+            }
+            return outputPath;
         });
-        return outputPath;
     }
 
     /**
@@ -1308,44 +1381,74 @@ class ComfyUIClient {
     /**
      * 等待任务完成
      */
+    /**
+     * ComfyUI 把执行失败记在 history.status 里，status_str 为 error。
+     * 返回给调用方的错误文本；没有失败时返回空字符串。
+     */
+    executionFailure(promptData) {
+        const status = promptData && promptData.status;
+        if (!status) return '';
+
+        const messages = Array.isArray(status.messages) ? status.messages : [];
+        let detail = '';
+        for (const message of messages) {
+            const event = Array.isArray(message) ? message[0] : message && message.event;
+            const data = Array.isArray(message) ? message[1] : message && message.data;
+            if (event !== 'execution_error' || !data) continue;
+            const line = String(data.exception_message || data.exception_type || '').split('\n')[0];
+            const where = [data.node_type, data.node_id].filter(Boolean).join(' ');
+            detail = [where, line].filter(Boolean).join(': ');
+            break;
+        }
+
+        if (status.status_str === 'error' || detail) {
+            return detail ? `任务执行失败: ${detail}` : '任务执行失败';
+        }
+        return '';
+    }
+
+    historyHasFiles(promptData) {
+        if (!promptData || !promptData.outputs) return false;
+        for (const nodeOutput of Object.values(promptData.outputs)) {
+            const files = [
+                ...(nodeOutput.images || []),
+                ...(nodeOutput.videos || []),
+                ...(nodeOutput.gifs || [])
+            ];
+            if (files.length > 0) return true;
+        }
+        return false;
+    }
+
     async waitForCompletion() {
         console.log('\n⏳ 等待任务完成...');
 
         const startTime = Date.now();
         let lastStatus = null;
-        let hasOutput = false;
+        let notedPendingOutput = false;
 
         while (Date.now() - startTime < this.config.timeout) {
             try {
                 const history = await this.getHistory();
+                const promptData = history && history[this.promptId];
 
-                if (history[this.promptId]) {
-                    const promptData = history[this.promptId];
+                if (promptData) {
+                    const failure = this.executionFailure(promptData);
+                    if (failure) throw new ComfyExecutionError(failure);
 
-                    if (promptData.outputs && Object.keys(promptData.outputs).length > 0) {
-                        let hasFiles = false;
-                        for (const [nodeId, nodeOutput] of Object.entries(promptData.outputs)) {
-                            if (nodeOutput.images && nodeOutput.images.length > 0) {
-                                hasFiles = true;
-                                break;
-                            }
-                        }
-
-                        if (hasFiles) {
-                            console.log('✅ 检测到输出文件，任务完成');
-                            return promptData;
-                        }
+                    if (this.historyHasFiles(promptData)) {
+                        console.log('✅ 检测到输出文件，任务完成');
+                        return promptData;
                     }
 
                     if (promptData.status && promptData.status.completed) {
                         if (promptData.outputs && Object.keys(promptData.outputs).length > 0) {
                             console.log('✅ 任务已完成（有输出）');
                             return promptData;
-                        } else {
-                            if (!hasOutput) {
-                                console.log('⏳ 任务标记完成但尚未有输出，继续等待...');
-                                hasOutput = true;
-                            }
+                        }
+                        if (!notedPendingOutput) {
+                            console.log('⏳ 任务标记完成但尚未有输出，继续等待...');
+                            notedPendingOutput = true;
                         }
                     }
                 }
@@ -1361,6 +1464,7 @@ class ComfyUIClient {
                 await new Promise(resolve => setTimeout(resolve, this.config.pollInterval));
 
             } catch (error) {
+                if (error instanceof ComfyExecutionError) throw error;
                 console.warn(`⚠️  轮询错误: ${error.message}`);
                 await new Promise(resolve => setTimeout(resolve, this.config.pollInterval));
             }
